@@ -3,7 +3,7 @@ import math
 import re
 import base64
 import time
-import logging  # [추가] 에러 로그 출력을 위해 필요
+import logging
 from typing import Iterable, List, Optional
 
 import requests
@@ -88,7 +88,7 @@ def build_keyword_filter_q(keywords: list[str]) -> Q:
 
 
 # =========================================================
-# 1) Gemini generateContent (안전장치 추가됨)
+# 1) Gemini generateContent (타임아웃 방어 코드 적용)
 # =========================================================
 def _gemini_generate_text(prompt: str, *, force_json: bool = True) -> str:
     api_key = getattr(settings, "GEMINI_API_KEY", "")
@@ -103,14 +103,15 @@ def _gemini_generate_text(prompt: str, *, force_json: bool = True) -> str:
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
 
     try:
-        # [수정] timeout 설정 및 예외 처리
-        resp = requests.post(url, json=payload, headers=headers, timeout=(5, 20), verify=False)
-        resp.raise_for_status() # 400, 500 에러 시 예외 발생
+        # [핵심] timeout=(5, 15): 연결 5초, 응답대기 15초. 
+        # 15초 넘으면 즉시 에러 발생시키고 catch 블록으로 이동 -> 서버 다운 방지
+        resp = requests.post(url, json=payload, headers=headers, timeout=(5, 15), verify=False)
+        resp.raise_for_status() 
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
-        # 에러가 나면 로그를 찍고 빈 문자열 반환 (호출하는 쪽에서 처리)
-        logger.error(f"Gemini API Error: {e}")
-        return "" # 빈 문자열 반환하여 fallback 유도
+        # 에러 발생 시 로그만 남기고 빈 값 반환 -> 이후 로직에서 기본 멘트로 대체됨
+        logger.error(f"Gemini API Timeout/Error: {e}")
+        return ""
 
 def build_user_preference_text(v: dict) -> str:
     lines = [f"- 자유요청: {v.get('prompt', '')}"]
@@ -181,10 +182,11 @@ def gemini_embed_text(text: str, *, task_type="RETRIEVAL_QUERY", title=None) -> 
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
 
     try:
+        # 임베딩도 10초 타임아웃
         resp = requests.post(url, json=payload, headers=headers, timeout=(5, 10), verify=False)
         if resp.status_code != 200: 
             logger.error(f"Embedding Error: {resp.text}")
-            return [] # 실패시 빈 리스트
+            return []
         return resp.json()["embedding"]["values"]
     except Exception as e:
         logger.error(f"Embedding Exception: {e}")
@@ -207,8 +209,7 @@ def gemini_batch_embed_texts(texts: List[str], *, _depth: int = 0) -> List[List[
         resp = requests.post(url, json=payload, headers=headers, timeout=(10, 60), verify=False)
         if resp.status_code != 200:
             logger.error(f"Batch Embed Error: {resp.text}")
-            if _depth >= 3: return [[] for _ in texts] # 재시도 횟수 줄임
-            # 재시도 로직 유지
+            if _depth >= 3: return [[] for _ in texts]
             mid = len(texts) // 2
             left = gemini_batch_embed_texts(texts[:mid], _depth=_depth + 1)
             right = gemini_batch_embed_texts(texts[mid:], _depth=_depth + 1)
@@ -247,7 +248,7 @@ def ensure_book_embedding(book, *, force: bool = False):
         return obj.embedding, float(obj.embedding_norm)
     
     emb = gemini_embed_text(build_book_document_text(book))
-    if not emb: return [], 0.0 # 임베딩 실패시 빈 값
+    if not emb: return [], 0.0
 
     n = vector_norm(emb)
     obj.embedding = emb
@@ -258,7 +259,7 @@ def ensure_book_embedding(book, *, force: bool = False):
 
 
 # =========================================================
-# [수정] 5) Reason Generation (추천 사유 생성 개선 - 안전장치)
+# 5) Reason Generation (Fallback 강화)
 # =========================================================
 
 def _trim_to_sentence_end(s: str, max_len: int = 250) -> str:
@@ -275,7 +276,7 @@ def _trim_to_sentence_end(s: str, max_len: int = 250) -> str:
     else:
         return truncated.strip() + "..."
 
-# Fallback 문구
+# [Fallback] AI 실패 시 나가는 기본 멘트
 def heuristic_reason(*, book, user_keywords: List[str], mood: Optional[str], themes: List[str]) -> str:
     cat = book.category.name if getattr(book, "category", None) else "이 분야"
     return f"'{book.title}'은 {cat} 분야의 수작으로, 요청하신 주제에 대해 깊이 있는 통찰을 제공합니다. 이 책을 통해 새로운 관점을 얻으실 수 있을 거예요."
@@ -310,21 +311,24 @@ def generate_reason_for_book(*, user_pref_text, user_keywords, mood, themes, boo
 """.strip()
 
     try:
-        # [수정] 여기서 에러 발생시 heuristic_reason으로 바로 넘어감
+        # [핵심] 여기서 AI 호출. 실패하면 _gemini_generate_text 내부에서 빈값("") 리턴
         raw = _gemini_generate_text(prompt, force_json=False)
-        if not raw: # AI 응답이 없거나 실패한 경우
-            raise ValueError("AI generation failed")
+        
+        # 빈값이면 에러로 간주하고 Exception 발생 -> Fallback으로 이동
+        if not raw: 
+            raise ValueError("AI response is empty (Timeout or Error)")
 
         txt = _strip_wrapping_quotes(_strip_code_fence(raw)).strip()
         final_reason = _trim_to_sentence_end(txt, 280)
         
         if len(final_reason) < 30: 
-            return heuristic_reason(book=book, user_keywords=user_keywords, mood=mood, themes=themes)
+            raise ValueError("AI response too short")
             
         return final_reason
+
     except Exception as e:
-        # 로그 출력 후 안전하게 기본 멘트 반환
-        logger.warning(f"Reason Gen Failed for {book.title}: {e}")
+        # [방어] 어떤 에러가 나도 절대 서버를 죽이지 않고 기본 멘트 반환
+        logger.warning(f"Using Fallback Reason for {book.title}: {e}")
         return heuristic_reason(book=book, user_keywords=user_keywords, mood=mood, themes=themes)
 
 
@@ -372,6 +376,7 @@ def generate_comic_image_file(book_title: str, book_summary: str) -> ContentFile
     print(f"🔥 [DEBUG] Imagen 요청 시작 (Title: {book_title})")
 
     try:
+        # 이미지 생성도 타임아웃 50초 설정
         resp = requests.post(url, json=payload, headers=headers, timeout=50, verify=False)
         if resp.status_code != 200:
             raise ValueError(f"Imagen API 실패 ({resp.status_code}): {resp.text}")
