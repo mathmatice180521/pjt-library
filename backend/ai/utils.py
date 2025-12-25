@@ -8,20 +8,25 @@ from typing import Iterable, List, Optional
 
 import requests
 import urllib3
+# SSL 경고 무시
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from django.conf import settings
 from django.core.files.base import ContentFile
 from django.db.models import Q 
 
+# 로깅 설정
 logger = logging.getLogger(__name__)
+
+# SSAFY GMS 프록시 주소
 GEMINI_BASE_URL = "https://gms.ssafy.io/gmsapi/generativelanguage.googleapis.com"
 
 
 # =========================================================
-# 공통 유틸
+# [1] 공통 유틸리티 함수
 # =========================================================
 def _strip_code_fence(s: str) -> str:
+    """마크다운 코드 블록(```json 등) 제거"""
     if not s: return s
     s = s.strip()
     s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
@@ -29,31 +34,37 @@ def _strip_code_fence(s: str) -> str:
     return s.strip()
 
 def _strip_wrapping_quotes(s: str) -> str:
+    """문자열 앞뒤 따옴표 제거"""
     s = (s or "").strip()
     if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
         return s[1:-1].strip()
     return s
 
 def _extract_json(text: str):
+    """AI 응답 텍스트에서 JSON 객체 추출"""
     if not text: return None
     t = _strip_code_fence(text)
     try: return json.loads(t)
     except Exception: pass
+    
+    # JSON처럼 생긴 부분 찾기 ({...} 또는 [...])
     m = re.search(r"(\[[\s\S]*?\]|\{[\s\S]*?\})", t)
     if not m: return None
     candidate = m.group(1).strip()
+    # 혹시 모를 trailing comma 제거
     candidate = re.sub(r",\s*([\]}])", r"\1", candidate)
     try: return json.loads(candidate)
     except Exception: return None
 
 def _normalize_space(s: str) -> str:
+    """줄바꿈을 공백으로 치환하고 다중 공백 제거"""
     s = (s or "").replace("\n", " ").strip()
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
 
 # =========================================================
-# 불용어 및 헬퍼 함수
+# [2] 불용어 및 검색어 처리
 # =========================================================
 STOPWORDS = {
     "추천", "해줘", "해주세요", "좋은", "요즘", "최근", "많이", "위주", "느낌",
@@ -65,6 +76,7 @@ STOPWORDS = {
 }
 
 def extract_keywords_fallback(text: str, *, limit: int = 8) -> list[str]:
+    """단순 형태소 분석 느낌으로 단어 추출 (Fallback용)"""
     tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", (text or "").lower())
     out: list[str] = []
     for t in tokens:
@@ -74,6 +86,7 @@ def extract_keywords_fallback(text: str, *, limit: int = 8) -> list[str]:
     return out
 
 def build_keyword_filter_q(keywords: list[str]) -> Q:
+    """키워드 리스트로 Django Q 필터 생성"""
     q = Q()
     for kw in keywords:
         q |= Q(title__icontains=kw)
@@ -84,13 +97,13 @@ def build_keyword_filter_q(keywords: list[str]) -> Q:
 
 
 # =========================================================
-# 1) Gemini generateContent (기존 유지)
+# [3] Gemini API 호출 (텍스트 생성) - 타임아웃 적용
 # =========================================================
 def _gemini_generate_text(prompt: str, *, force_json: bool = True) -> str:
-    # ... (기존과 동일, 타임아웃 방지 코드 포함된 버전 사용) ...
+    """Gemini Pro 모델 호출"""
     api_key = getattr(settings, "GEMINI_API_KEY", "")
     model = getattr(settings, "GEMINI_MODEL", "gemini-2.5-flash")
-    if not api_key: raise ValueError("GEMINI_API_KEY Missing")
+    if not api_key: raise ValueError("GEMINI_API_KEY가 설정되지 않았습니다.")
 
     url = f"{GEMINI_BASE_URL}/v1beta/models/{model}:generateContent?key={api_key}"
     generation_config = {"temperature": 0.3, "topP": 0.8, "topK": 40, "maxOutputTokens": 800}
@@ -100,20 +113,32 @@ def _gemini_generate_text(prompt: str, *, force_json: bool = True) -> str:
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
 
     try:
+        # [타임아웃 설정] 연결 5초, 응답 30초
         resp = requests.post(url, json=payload, headers=headers, timeout=(5, 30), verify=False)
         resp.raise_for_status() 
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
         logger.error(f"Gemini API Error: {e}")
-        return ""
+        return "" # 실패 시 빈 문자열 반환
+
+def build_user_preference_text(v: dict) -> str:
+    """사용자 요청 딕셔너리를 하나의 문장으로 요약"""
+    lines = [f"- 자유요청: {v.get('prompt', '')}"]
+    if v.get("mood"): lines.append(f"- 분위기: {v['mood']}")
+    themes = v.get("themes") or []
+    if themes: lines.append(f"- 원하는 주제/요소: {', '.join(themes)}")
+    length = v.get("length")
+    if length: lines.append(f"- 분량 선호: {length}")
+    return "\n".join(lines).strip()
+
 
 # =========================================================
-# [수정 1] 사용자 의도 파악 함수 개선 (문장 이해력 강화)
+# [4] 사용자 의도 파악 (문장 이해력 강화)
 # =========================================================
 def extract_intent_json(user_prompt: str) -> dict:
     p = (user_prompt or "").strip()
     
-    # 프롬프트를 변경하여 단순 키워드 추출이 아닌 '의미 해석'을 유도
+    # [수정] 프롬프트를 개선하여 '문장'의 의미를 해석하도록 유도
     prompt = (
         "너는 최고의 도서 검색 전문가다.\n"
         "사용자가 입력한 문장의 '속뜻'과 '핵심 감정', '상황'을 파악해라.\n"
@@ -123,7 +148,9 @@ def extract_intent_json(user_prompt: str) -> dict:
         "  \"intent\": \"사용자의 의도를 한 문장으로 요약 (예: 위로가 필요한 상황에서 읽기 편한 에세이 요청)\",\n"
         "  \"core_topics\": [\"핵심 키워드1\", \"키워드2\", \"키워드3\"],\n"
         "  \"mood\": \"분위기 (예: 따뜻한, 우울한, 진지한)\",\n"
-        "  \"target_audience\": \"추정 독자층\"\n"
+        "  \"request_type\": \"요청유형\",\n"
+        "  \"avoid\": [\"피하고 싶은 것\"],\n"
+        "  \"notes\": \"기타 특이사항\"\n"
         "}\n\n"
         "규칙:\n"
         "1. 사용자가 '설명'을 했다면 그 상황에 어울리는 '추상적 키워드'를 뽑아라. (예: '회사 가기 싫어' -> '번아웃', '힐링', '직장인')\n"
@@ -131,23 +158,31 @@ def extract_intent_json(user_prompt: str) -> dict:
     )
 
     raw = _gemini_generate_text(prompt, force_json=True)
-    if not raw: return {}
+    if not raw: return {} # 에러 시 빈 딕셔너리 반환
 
     data = _extract_json(raw)
     if not isinstance(data, dict): data = {}
 
-    # 키워드 전처리 로직 (기존 유지)
+    # 결과 데이터 정제
     core = data.get("core_topics") or []
-    # ... (STOPWORDS 필터링 등 기존 로직 유지) ...
-    
-    # (코드 중략 없이 기존 STOPWORDS 로직 그대로 사용하시면 됩니다)
-    # 편의를 위해 간단히 적으면:
-    return data # (실제 구현시 위쪽의 필터링 로직 포함하세요)
+    filtered_core = []
+    for t in core:
+        t_clean = str(t).strip()
+        if t_clean in STOPWORDS: continue
+        if t_clean.endswith("관련"): t_clean = t_clean[:-2]
+        if t_clean and t_clean not in STOPWORDS: filtered_core.append(t_clean)
+    data["core_topics"] = filtered_core
 
-# ... (임베딩 관련 함수들: gemini_embed_text, ensure_book_embedding 등은 기존 유지) ...
+    if not data["core_topics"] and p:
+        cleaned_p = p.replace("추천", "").replace("해줘", "").strip()
+        if cleaned_p: data["core_topics"] = [cleaned_p[:10]]
+
+    if not isinstance(data.get("avoid"), list): data["avoid"] = []
+    return data
+
 
 # =========================================================
-# 2) Gemini embedContent
+# [5] 텍스트 임베딩 (벡터 검색용)
 # =========================================================
 def _sanitize_text(s: str, max_chars: int) -> str:
     s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", " ", (s or ""))
@@ -200,10 +235,6 @@ def gemini_batch_embed_texts(texts: List[str], *, _depth: int = 0) -> List[List[
         logger.error(f"Batch Embed Exception: {e}")
         return [[] for _ in texts]
 
-
-# =========================================================
-# 3) Vector math
-# =========================================================
 def vector_norm(v: Iterable[float]) -> float:
     return math.sqrt(sum((x * x) for x in v))
 
@@ -237,10 +268,11 @@ def ensure_book_embedding(book, *, force: bool = False):
 
 
 # =========================================================
-# 5) Reason Generation
+# [6] 추천 사유 생성 (형식 준수 및 길이 제한 강화)
 # =========================================================
 
 def _trim_to_sentence_end(s: str, max_len: int = 250) -> str:
+    """주어진 길이 근처에서 문장이 끝나도록 자름"""
     s = _normalize_space(s)
     if len(s) <= max_len:
         return s
@@ -254,23 +286,17 @@ def _trim_to_sentence_end(s: str, max_len: int = 250) -> str:
     else:
         return truncated.strip() + "..."
 
-# 기본 멘트 (AI 실패시 사용)
+# Fallback용 기본 멘트
 def heuristic_reason(*, book, user_keywords: List[str], mood: Optional[str], themes: List[str]) -> str:
     cat = book.category.name if getattr(book, "category", None) else "이 분야"
     return f"'{book.title}'은 {cat} 분야의 수작으로, 요청하신 주제에 대해 깊이 있는 통찰을 제공합니다. 이 책을 통해 새로운 관점을 얻으실 수 있을 거예요."
 
-# =========================================================
-# [수정 2] 추천 사유 생성 함수 (정성스런 말투 + 길이 제한 + 형식 준수)
-# =========================================================
 def generate_reason_for_book(*, user_pref_text, user_keywords, mood, themes, book, match_keywords) -> str:
     cat_name = book.category.name if getattr(book, "category", None) else ""
     desc = (book.description or "").replace("\n", " ").strip()
     desc = desc[:400]
 
-    # [프롬프트 대폭 수정]
-    # 1. 역할 부여: '다정하고 식견 넓은 큐레이터'
-    # 2. 형식 강제: 줄거리와 이유를 명확히 구분
-    # 3. 길이 제한: DB 짤림 방지를 위해 300자 이내로 제한 (중요!)
+    # [수정] 프롬프트 강화: 큐레이터 페르소나, 형식 강제, 길이 제한
     prompt = (
         "당신은 서점의 다정하고 식견 넓은 'AI 큐레이터'입니다.\n"
         "손님(사용자)의 상황에 맞춰 이 책을 추천하는 **정성스러운 추천사**를 작성해주세요.\n\n"
@@ -290,21 +316,28 @@ def generate_reason_for_book(*, user_pref_text, user_keywords, mood, themes, boo
     try:
         raw = _gemini_generate_text(prompt, force_json=False)
         
-        if not raw: raise ValueError("AI response empty")
+        # AI 응답이 비었거나 오류면 에러 발생 -> Fallback으로 이동
+        if not raw: 
+            raise ValueError("AI response is empty")
 
         txt = _strip_wrapping_quotes(_strip_code_fence(raw)).strip()
         
-        # [안전장치] 그래도 길면 250자에서 문장 단위로 자름
+        # 250자 제한으로 자르기
         final_reason = _trim_to_sentence_end(txt, 250)
         
+        if len(final_reason) < 30: 
+            raise ValueError("Response too short")
+            
         return final_reason
 
     except Exception as e:
-        logger.warning(f"Fallback reason used: {e}")
-        return f"'{book.title}'은 {cat_name} 분야에서 사랑받는 책입니다. 요청하신 내용과 관련하여 깊은 울림을 줄 수 있어 추천해 드립니다."
+        # 에러 발생 시(타임아웃 등) 서버 죽이지 말고 기본 멘트 반환
+        logger.warning(f"Using Fallback for {book.title}: {e}")
+        return heuristic_reason(book=book, user_keywords=user_keywords, mood=mood, themes=themes)
+
 
 # =========================================================
-# 6) Imagen 4.0 4컷 만화 생성
+# [7] Imagen 4.0 4컷 만화 생성 (타임아웃 방지 적용)
 # =========================================================
 def generate_comic_image_file(book_title: str, book_summary: str) -> ContentFile:
     api_key = getattr(settings, "GEMINI_API_KEY", "")
@@ -312,7 +345,7 @@ def generate_comic_image_file(book_title: str, book_summary: str) -> ContentFile
 
     url = f"{GEMINI_BASE_URL}/v1beta/models/imagen-4.0-generate-001:predict"
 
-    # [단계 1] 시나리오 생성 (주석 오해 방지용 포맷 변경)
+    # [단계 1] 시나리오 생성
     scenario_prompt = (
         "You are a visual storyteller. I need a description for a 4-panel comic strip about the book.\n"
         f"Book Title: {book_title}\n"
@@ -341,9 +374,10 @@ def generate_comic_image_file(book_title: str, book_summary: str) -> ContentFile
     }
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
 
-    print(f"🔥 [DEBUG] Imagen 요청 시작 (Title: {book_title})")
+    logger.info(f"Imagen Request for: {book_title}")
 
     try:
+        # 이미지 생성 타임아웃 50초
         resp = requests.post(url, json=payload, headers=headers, timeout=50, verify=False)
         if resp.status_code != 200:
             raise ValueError(f"Imagen API 실패 ({resp.status_code}): {resp.text}")
