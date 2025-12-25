@@ -13,33 +13,17 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 import os
 from pathlib import Path
 import dj_database_url
-
-from dotenv import load_dotenv # dotenv 임포트
+from datetime import timedelta
+from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# [수정] .env 파일 경로 설정 (1번 상황: backend 폴더 내부에 있을 때)
-# BASE_DIR이 곧 backend 폴더를 가리킵니다.
-env_path = BASE_DIR / ".env"
-
-# .env 파일 로드 시도
-if env_path.exists():
-    print(f"✅ .env 파일을 찾았습니다: {env_path}")
-    load_dotenv(dotenv_path=env_path, override=True)
-else:
-    print(f"⚠️ .env 파일을 찾을 수 없습니다: {env_path}")
-    # 혹시 몰라 상위 폴더도 한 번 찾아보는 예비 코드 (필요 없으면 무시됨)
-    load_dotenv(dotenv_path=BASE_DIR.parent / ".env", override=True)
+# .env 파일 로드
+load_dotenv(dotenv_path=BASE_DIR.parent / ".env", override=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-# [확인용] 서버 켜질 때 키가 제대로 들어왔는지 콘솔에 출력
-if GEMINI_API_KEY:
-    print(f"🔑 API Key 로드 성공 (앞 5자리): {GEMINI_API_KEY[:5]}...")
-else:
-    print("🔥 [경고] GEMINI_API_KEY가 없습니다! .env 파일 내용을 확인하세요.")
 
 # 임베딩(semantic search)용 모델
 GEMINI_EMBED_MODEL = "text-embedding-004"
@@ -60,7 +44,6 @@ AI_MAX_EMBED_TITLE_CHARS = int(os.getenv("AI_MAX_EMBED_TITLE_CHARS", "120"))
 SECRET_KEY = "django-insecure-t8=ook9j-uzm*e&pzxo+3on1&c*yo*pg^dn6g7j^k%kw*(tl2_"
 
 # SECURITY WARNING: don't run with debug turned on in production!
-# 서버 배포가 진행중이면 True -> False로 수정!
 DEBUG = True
 
 ALLOWED_HOSTS = ["*"]
@@ -69,7 +52,7 @@ ALLOWED_HOSTS = ["*"]
 # Application definition
 
 INSTALLED_APPS = [
-    "corsheaders",
+    "corsheaders",  # CORS 처리를 위해 필수
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -87,8 +70,6 @@ INSTALLED_APPS = [
     "ai",
 ]
 
-from datetime import timedelta
-
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
@@ -105,9 +86,9 @@ REST_FRAMEWORK = {
 }
 
 MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware", # [중요] 최상단 위치 유지
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
-    "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -116,8 +97,17 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
-CORS_ALLOW_ALL_ORIGINS = True  # 개발용
-# 또는 CORS_ALLOWED_ORIGINS = ["http://localhost:5173", ...]
+# ==============================================================================
+# [수정] CORS 설정 (에러가 발생한 v1 주소 추가)
+# ==============================================================================
+# 개발 중에는 True로 해도 되지만, 배포 시에는 명시하는 것이 좋습니다.
+# CORS_ALLOW_ALL_ORIGINS = True 
+
+CORS_ALLOWED_ORIGINS = [
+    "https://ungseongx2v1.netlify.app",        # [현재 에러 발생 주소]
+    "https://ungseongx2v2.netlify.app",        # [이전 주소] (혹시 몰라 유지)
+    "http://localhost:5173",                   # [로컬 테스트용]
+]
 
 CORS_ALLOW_CREDENTIALS = True
 
@@ -140,20 +130,26 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "config.wsgi.application"
 
+# ==============================================================================
+# [수정] CSRF 신뢰 도메인 설정 (백엔드 주소도 에러 로그에 맞춰 수정)
+# ==============================================================================
 CSRF_TRUSTED_ORIGINS = [
-    "https://candid-manatee-f4b3ab.netlify.app",
-    "https://pjt-library-production.up.railway.app",
+    "https://ungseongx2v1.netlify.app",        # [현재 프론트엔드]
+    "https://ungseongx2v2.netlify.app",        # [이전 프론트엔드]
+    "https://unseongx2.up.railway.app",        # [현재 에러 로그의 백엔드 주소]
+    "https://pjtv2-production.up.railway.app", # [이전 백엔드 주소]
 ]
 
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
 DATABASES = {
+    # 로컬 테스트용 (필요시 주석 해제)
     # "default": {
     #     "ENGINE": "django.db.backends.sqlite3",
     #     "NAME": BASE_DIR / "db.sqlite3",
     # }
-    # 원격 서버로 운용할꺼면 위를 주석하고 아래를 주석해제
+    # 배포용 (Railway)
     "default": dj_database_url.config(
         default=f'sqlite:///{BASE_DIR / "db.sqlite3"}', conn_max_age=600
     )
@@ -204,7 +200,3 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # 슬래시가 없는 URL로 요청이 와도 자동으로 슬래시를 붙여서 처리하도록 유도
 APPEND_SLASH = True
-
-# 이 설정이 있어야 'media/comics' 폴더에 이미지가 저장됩니다.
-MEDIA_URL = '/media/'
-MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
