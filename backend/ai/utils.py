@@ -8,17 +8,13 @@ from typing import Iterable, List, Optional
 
 import requests
 import urllib3
-# SSL 경고 무시
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from django.conf import settings
 from django.core.files.base import ContentFile
 from django.db.models import Q 
 
-# 로깅 설정
 logger = logging.getLogger(__name__)
-
-# SSAFY GMS 프록시
 GEMINI_BASE_URL = "https://gms.ssafy.io/gmsapi/generativelanguage.googleapis.com"
 
 
