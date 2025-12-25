@@ -43,6 +43,7 @@ def _extract_json(text: str):
     t = _strip_code_fence(text)
     try: return json.loads(t)
     except Exception: pass
+    
     m = re.search(r"(\[[\s\S]*?\]|\{[\s\S]*?\})", t)
     if not m: return None
     candidate = m.group(1).strip()
@@ -88,7 +89,7 @@ def build_keyword_filter_q(keywords: list[str]) -> Q:
 
 
 # =========================================================
-# [3] Gemini API 호출 (텍스트 생성) - 타임아웃 8초!
+# [3] Gemini API 호출 (텍스트 생성) - 시간 넉넉하게 설정
 # =========================================================
 def _gemini_generate_text(prompt: str, *, force_json: bool = True) -> str:
     api_key = getattr(settings, "GEMINI_API_KEY", "")
@@ -96,21 +97,21 @@ def _gemini_generate_text(prompt: str, *, force_json: bool = True) -> str:
     if not api_key: raise ValueError("GEMINI_API_KEY가 설정되지 않았습니다.")
 
     url = f"{GEMINI_BASE_URL}/v1beta/models/{model}:generateContent?key={api_key}"
-    generation_config = {"temperature": 0.3, "topP": 0.8, "topK": 40, "maxOutputTokens": 800}
+    generation_config = {"temperature": 0.4, "topP": 0.9, "topK": 40, "maxOutputTokens": 1000}
     if force_json: generation_config["responseMimeType"] = "application/json"
 
     payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": generation_config}
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
 
     try:
-        # [수정됨] 연결 3초, 응답대기 8초 (총 11초 넘기지 않음)
-        # 8초 안에 답 안 오면 에러 발생 -> Fallback으로 넘어감
-        resp = requests.post(url, json=payload, headers=headers, timeout=(3, 8), verify=False)
+        # [시간 설정] 연결 5초, 응답대기 60초 (사용자 요청 반영: 최대 1분)
+        # Gunicorn 타임아웃 설정이 뒷받침되어야 500 에러가 안 납니다.
+        resp = requests.post(url, json=payload, headers=headers, timeout=(5, 60), verify=False)
         resp.raise_for_status() 
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
-        logger.error(f"Gemini API Timeout/Error: {e}")
-        return "" 
+        logger.error(f"Gemini API Error: {e}")
+        return ""
 
 def build_user_preference_text(v: dict) -> str:
     lines = [f"- 자유요청: {v.get('prompt', '')}"]
@@ -123,25 +124,29 @@ def build_user_preference_text(v: dict) -> str:
 
 
 # =========================================================
-# [4] 사용자 의도 파악
+# [4] 사용자 의도 파악 (문장 추리력 대폭 강화)
 # =========================================================
 def extract_intent_json(user_prompt: str) -> dict:
     p = (user_prompt or "").strip()
     
+    # [핵심] 사용자의 '상황'을 추리하여 '검색 가능한 키워드'로 변환해주는 프롬프트
     prompt = (
-        "너는 최고의 도서 검색 전문가다.\n"
-        "사용자가 입력한 문장의 '속뜻'과 '핵심 감정', '상황'을 파악해라.\n"
+        "너는 최고의 도서 큐레이터이자 심리 분석가다.\n"
+        "사용자의 입력 문장을 깊이 분석해서, 그 상황에 딱 맞는 책을 찾을 수 있는 '검색 키워드'를 추론해라.\n"
+        "입력된 단어만 쓰지 말고, 문맥상 연상되는 단어를 확장해라.\n\n"
         f"[사용자 입력]: \"{p}\"\n\n"
-        "다음 JSON 형식으로만 출력해라 (설명 금지):\n"
+        "예시 1: '회사 가기 싫고 다 그만두고 싶어' -> 의도: 번아웃 위로, 키워드: ['힐링', '에세이', '퇴사', '직장인', '휴식']\n"
+        "예시 2: '배가 너무 고픈데 맛있는 거 나오는 소설' -> 의도: 음식 묘사가 좋은 소설, 키워드: ['요리', '미식', '식당', '음식']\n\n"
+        "다음 JSON 형식으로만 출력해라:\n"
         "{\n"
         "  \"intent\": \"사용자의 의도를 한 문장으로 요약\",\n"
-        "  \"core_topics\": [\"핵심 키워드1\", \"키워드2\"],\n"
-        "  \"mood\": \"분위기\",\n"
-        "  \"avoid\": []\n"
+        "  \"core_topics\": [\"DB 검색용 핵심 명사 (3~5개)\"],\n"
+        "  \"mood\": \"분위기 (예: 따뜻한, 진지한, 긴박한)\",\n"
+        "  \"avoid\": [\"피하고 싶은 요소\"]\n"
         "}\n\n"
         "규칙:\n"
-        "1. 상황에 어울리는 '추상적 키워드'를 뽑아라.\n"
-        "2. '책', '추천' 등 불용어 제외."
+        "1. '책', '추천' 같은 무의미한 단어는 절대 포함하지 마라.\n"
+        "2. 사용자가 긴 문장으로 설명하면, 그 안의 감정과 상황을 명사형 키워드로 변환해라."
     )
 
     raw = _gemini_generate_text(prompt, force_json=True)
@@ -159,6 +164,7 @@ def extract_intent_json(user_prompt: str) -> dict:
         if t_clean and t_clean not in STOPWORDS: filtered_core.append(t_clean)
     data["core_topics"] = filtered_core
 
+    # 키워드 추출 실패시, 원본에서 명사라도 건짐
     if not data["core_topics"] and p:
         cleaned_p = p.replace("추천", "").replace("해줘", "").strip()
         if cleaned_p: data["core_topics"] = [cleaned_p[:10]]
@@ -168,7 +174,7 @@ def extract_intent_json(user_prompt: str) -> dict:
 
 
 # =========================================================
-# [5] 텍스트 임베딩
+# [5] 텍스트 임베딩 (벡터 검색)
 # =========================================================
 def _sanitize_text(s: str, max_chars: int) -> str:
     s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", " ", (s or ""))
@@ -184,8 +190,8 @@ def gemini_embed_text(text: str, *, task_type="RETRIEVAL_QUERY", title=None) -> 
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
 
     try:
-        # 임베딩 타임아웃도 5초로 단축
-        resp = requests.post(url, json=payload, headers=headers, timeout=(3, 5), verify=False)
+        # 임베딩은 빠르지만 넉넉히 10초
+        resp = requests.post(url, json=payload, headers=headers, timeout=(5, 10), verify=False)
         if resp.status_code != 200: 
             return []
         return resp.json()["embedding"]["values"]
@@ -207,8 +213,7 @@ def gemini_batch_embed_texts(texts: List[str], *, _depth: int = 0) -> List[List[
     payload = {"requests": [{"model": f"models/{model}", "content": {"parts": [{"text": t}]}} for t in safe_texts]}
 
     try:
-        # 배치 임베딩 타임아웃 20초
-        resp = requests.post(url, json=payload, headers=headers, timeout=(5, 20), verify=False)
+        resp = requests.post(url, json=payload, headers=headers, timeout=(5, 30), verify=False)
         if resp.status_code != 200:
             if _depth >= 3: return [[] for _ in texts]
             mid = len(texts) // 2
@@ -256,34 +261,30 @@ def ensure_book_embedding(book, *, force: bool = False):
 
 
 # =========================================================
-# [6] 추천 사유 생성 (8초 룰 적용)
+# [6] 추천 사유 생성 (시간 넉넉하게, 퀄리티 UP)
 # =========================================================
 
 def _trim_to_sentence_end(s: str, max_len: int = 250) -> str:
     s = _normalize_space(s)
     if len(s) <= max_len:
         return s
-    
     truncated = s[:max_len]
     match = list(re.finditer(r'[.!?](?:\s|$)', truncated))
-    
     if match:
         last_match = match[-1]
         return truncated[:last_match.end()].strip()
     else:
         return truncated.strip() + "..."
 
-# [Fallback] AI 실패 시 나가는 기본 멘트
 def heuristic_reason(*, book, user_keywords: List[str], mood: Optional[str], themes: List[str]) -> str:
     cat = book.category.name if getattr(book, "category", None) else "이 분야"
-    return f"'{book.title}'은 {cat} 분야의 수작으로, 요청하신 주제에 대해 깊이 있는 통찰을 제공합니다. 이 책을 통해 새로운 관점을 얻으실 수 있을 거예요."
+    return f"'{book.title}'은 {cat} 분야의 수작으로, 요청하신 주제에 대해 깊이 있는 통찰을 제공합니다."
 
 def generate_reason_for_book(*, user_pref_text, user_keywords, mood, themes, book, match_keywords) -> str:
     cat_name = book.category.name if getattr(book, "category", None) else ""
     desc = (book.description or "").replace("\n", " ").strip()
     desc = desc[:400]
 
-    # 프롬프트 구성 (형식 준수, 길이 제한)
     prompt = (
         "당신은 서점의 다정하고 식견 넓은 'AI 큐레이터'입니다.\n"
         "손님(사용자)의 상황에 맞춰 이 책을 추천하는 **정성스러운 추천사**를 작성해주세요.\n\n"
@@ -296,33 +297,24 @@ def generate_reason_for_book(*, user_pref_text, user_keywords, mood, themes, boo
         "꼭 한번 읽어보시길 바랍니다.\n\n"
         "★작성 규칙★:\n"
         "1. 말투: '~입니다/합니다' 존댓말 사용, 따뜻하고 공감하는 어조.\n"
-        "2. **길이 제한**: 데이터베이스 저장을 위해 **공백 포함 250자 이내**로 핵심만 꽉 채워서 작성.\n"
-        "3. 내용: 책 내용이 없으면 당신의 지식으로 줄거리를 채우고, 뻔한 말보다는 구체적인 감상을 적을 것."
+        "2. **길이 제한**: 데이터베이스 저장을 위해 **공백 포함 250자 이내**로 작성.\n"
     )
 
     try:
-        # 여기서 8초 안에 안오면 에러 발생 -> catch로 이동
+        # [시간 설정] 60초까지 기다림 (사용자 요청 반영)
         raw = _gemini_generate_text(prompt, force_json=False)
-        
-        if not raw: 
-            raise ValueError("AI Timeout (8s)")
+        if not raw: raise ValueError("AI response empty")
 
         txt = _strip_wrapping_quotes(_strip_code_fence(raw)).strip()
-        final_reason = _trim_to_sentence_end(txt, 250)
-        
-        if len(final_reason) < 30: 
-            raise ValueError("Response too short")
-            
-        return final_reason
+        return _trim_to_sentence_end(txt, 250)
 
     except Exception as e:
-        # 8초 지나면 바로 기본 멘트 반환 (서버 멈춤 방지)
         logger.warning(f"Using Fallback Reason for {book.title}: {e}")
         return heuristic_reason(book=book, user_keywords=user_keywords, mood=mood, themes=themes)
 
 
 # =========================================================
-# [7] Imagen 4.0 4컷 만화 생성 (타임아웃 30초)
+# [7] Imagen 4.0 4컷 만화 생성 (시간제한 90초)
 # =========================================================
 def generate_comic_image_file(book_title: str, book_summary: str) -> ContentFile:
     api_key = getattr(settings, "GEMINI_API_KEY", "")
@@ -354,8 +346,9 @@ def generate_comic_image_file(book_title: str, book_summary: str) -> ContentFile
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
 
     try:
-        # 이미지 생성은 좀 더 기다려줌 (최대 30초)
-        resp = requests.post(url, json=payload, headers=headers, timeout=(5, 30), verify=False)
+        # [시간 설정] 이미지 생성은 오래 걸릴 수 있으므로 90초 설정
+        # (주의: 서버 타임아웃 설정을 90초 이상으로 늘려야 함)
+        resp = requests.post(url, json=payload, headers=headers, timeout=(5, 90), verify=False)
         if resp.status_code != 200:
             raise ValueError(f"Imagen API 실패 ({resp.status_code}): {resp.text}")
 
