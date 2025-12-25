@@ -3,6 +3,7 @@ import math
 import re
 import base64
 import time
+import logging  # [추가] 에러 로그 출력을 위해 필요
 from typing import Iterable, List, Optional
 
 import requests
@@ -13,6 +14,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from django.conf import settings
 from django.core.files.base import ContentFile
 from django.db.models import Q 
+
+# 로깅 설정
+logger = logging.getLogger(__name__)
 
 # SSAFY GMS 프록시
 GEMINI_BASE_URL = "https://gms.ssafy.io/gmsapi/generativelanguage.googleapis.com"
@@ -84,7 +88,7 @@ def build_keyword_filter_q(keywords: list[str]) -> Q:
 
 
 # =========================================================
-# 1) Gemini generateContent
+# 1) Gemini generateContent (안전장치 추가됨)
 # =========================================================
 def _gemini_generate_text(prompt: str, *, force_json: bool = True) -> str:
     api_key = getattr(settings, "GEMINI_API_KEY", "")
@@ -98,11 +102,15 @@ def _gemini_generate_text(prompt: str, *, force_json: bool = True) -> str:
     payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": generation_config}
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
 
-    # SSL verify=False 유지
-    resp = requests.post(url, json=payload, headers=headers, timeout=(10, 60), verify=False)
-    if resp.status_code != 200:
-        raise ValueError(f"Gemini generateContent 실패: {resp.status_code} {resp.text}")
-    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    try:
+        # [수정] timeout 설정 및 예외 처리
+        resp = requests.post(url, json=payload, headers=headers, timeout=(5, 20), verify=False)
+        resp.raise_for_status() # 400, 500 에러 시 예외 발생
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        # 에러가 나면 로그를 찍고 빈 문자열 반환 (호출하는 쪽에서 처리)
+        logger.error(f"Gemini API Error: {e}")
+        return "" # 빈 문자열 반환하여 fallback 유도
 
 def build_user_preference_text(v: dict) -> str:
     lines = [f"- 자유요청: {v.get('prompt', '')}"]
@@ -132,6 +140,8 @@ def extract_intent_json(user_prompt: str) -> dict:
 """.strip()
 
     raw = _gemini_generate_text(prompt, force_json=True)
+    if not raw: return {} # 에러나면 빈 딕셔너리
+
     data = _extract_json(raw)
     if not isinstance(data, dict): data = {}
 
@@ -170,9 +180,15 @@ def gemini_embed_text(text: str, *, task_type="RETRIEVAL_QUERY", title=None) -> 
     payload = {"content": {"parts": [{"text": _sanitize_text(text, 2500)}]}}
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
 
-    resp = requests.post(url, json=payload, headers=headers, timeout=(10, 60), verify=False)
-    if resp.status_code != 200: raise ValueError(f"Gemini embedContent 실패: {resp.text}")
-    return resp.json()["embedding"]["values"]
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=(5, 10), verify=False)
+        if resp.status_code != 200: 
+            logger.error(f"Embedding Error: {resp.text}")
+            return [] # 실패시 빈 리스트
+        return resp.json()["embedding"]["values"]
+    except Exception as e:
+        logger.error(f"Embedding Exception: {e}")
+        return []
 
 def gemini_batch_embed_texts(texts: List[str], *, _depth: int = 0) -> List[List[float]]:
     if not texts: return []
@@ -187,19 +203,23 @@ def gemini_batch_embed_texts(texts: List[str], *, _depth: int = 0) -> List[List[
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
     payload = {"requests": [{"model": f"models/{model}", "content": {"parts": [{"text": t}]}} for t in safe_texts]}
 
-    resp = requests.post(url, json=payload, headers=headers, timeout=(10, 120), verify=False)
-    if resp.status_code != 200:
-        print("BATCH_EMBED_ERROR_BODY:", resp.text)
-        if _depth >= 20: return [[] for _ in texts]
-        if len(texts) == 1: return [[]]
-        mid = len(texts) // 2
-        left = gemini_batch_embed_texts(texts[:mid], _depth=_depth + 1)
-        right = gemini_batch_embed_texts(texts[mid:], _depth=_depth + 1)
-        return left + right
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=(10, 60), verify=False)
+        if resp.status_code != 200:
+            logger.error(f"Batch Embed Error: {resp.text}")
+            if _depth >= 3: return [[] for _ in texts] # 재시도 횟수 줄임
+            # 재시도 로직 유지
+            mid = len(texts) // 2
+            left = gemini_batch_embed_texts(texts[:mid], _depth=_depth + 1)
+            right = gemini_batch_embed_texts(texts[mid:], _depth=_depth + 1)
+            return left + right
 
-    data = resp.json()
-    embeddings = data.get("embeddings") or []
-    return [e.get("values", []) for e in embeddings]
+        data = resp.json()
+        embeddings = data.get("embeddings") or []
+        return [e.get("values", []) for e in embeddings]
+    except Exception as e:
+        logger.error(f"Batch Embed Exception: {e}")
+        return [[] for _ in texts]
 
 
 # =========================================================
@@ -227,6 +247,8 @@ def ensure_book_embedding(book, *, force: bool = False):
         return obj.embedding, float(obj.embedding_norm)
     
     emb = gemini_embed_text(build_book_document_text(book))
+    if not emb: return [], 0.0 # 임베딩 실패시 빈 값
+
     n = vector_norm(emb)
     obj.embedding = emb
     obj.embedding_norm = n
@@ -236,27 +258,24 @@ def ensure_book_embedding(book, *, force: bool = False):
 
 
 # =========================================================
-# [수정] 5) Reason Generation (추천 사유 생성 개선)
+# [수정] 5) Reason Generation (추천 사유 생성 개선 - 안전장치)
 # =========================================================
 
-# [수정] 문장 자르기 로직 개선: 마침표가 없으면 자르지 않거나 ...으로 처리
 def _trim_to_sentence_end(s: str, max_len: int = 250) -> str:
     s = _normalize_space(s)
     if len(s) <= max_len:
         return s
     
     truncated = s[:max_len]
-    # 마지막 문장 종결 부호(. ! ?) 위치 찾기
     match = list(re.finditer(r'[.!?](?:\s|$)', truncated))
     
     if match:
         last_match = match[-1]
         return truncated[:last_match.end()].strip()
     else:
-        # 문장 부호가 없으면 어쩔 수 없이 ... 붙임
         return truncated.strip() + "..."
 
-# [수정] Fallback 문구 개선
+# Fallback 문구
 def heuristic_reason(*, book, user_keywords: List[str], mood: Optional[str], themes: List[str]) -> str:
     cat = book.category.name if getattr(book, "category", None) else "이 분야"
     return f"'{book.title}'은 {cat} 분야의 수작으로, 요청하신 주제에 대해 깊이 있는 통찰을 제공합니다. 이 책을 통해 새로운 관점을 얻으실 수 있을 거예요."
@@ -266,7 +285,6 @@ def generate_reason_for_book(*, user_pref_text, user_keywords, mood, themes, boo
     desc = (book.description or "").replace("\n", " ").strip()
     desc = desc[:400]
 
-    # [핵심 수정] 프롬프트 템플릿화: 사용자가 원하는 형식 강제
     prompt = f"""
 당신은 따뜻하고 통찰력 있는 'AI 도서 큐레이터 웅성이'입니다.
 사용자의 고민이나 관심사에 맞춰 이 책을 추천하는 이유를 아래 **형식**에 맞춰 작성해주세요.
@@ -292,22 +310,26 @@ def generate_reason_for_book(*, user_pref_text, user_keywords, mood, themes, boo
 """.strip()
 
     try:
+        # [수정] 여기서 에러 발생시 heuristic_reason으로 바로 넘어감
         raw = _gemini_generate_text(prompt, force_json=False)
+        if not raw: # AI 응답이 없거나 실패한 경우
+            raise ValueError("AI generation failed")
+
         txt = _strip_wrapping_quotes(_strip_code_fence(raw)).strip()
-        
-        # 문장 다듬기 (안전하게 자르기)
         final_reason = _trim_to_sentence_end(txt, 280)
         
         if len(final_reason) < 30: 
             return heuristic_reason(book=book, user_keywords=user_keywords, mood=mood, themes=themes)
             
         return final_reason
-    except Exception:
+    except Exception as e:
+        # 로그 출력 후 안전하게 기본 멘트 반환
+        logger.warning(f"Reason Gen Failed for {book.title}: {e}")
         return heuristic_reason(book=book, user_keywords=user_keywords, mood=mood, themes=themes)
 
 
 # =========================================================
-# 6) Imagen 4.0 4컷 만화 생성 (기존 유지)
+# 6) Imagen 4.0 4컷 만화 생성 (안전장치 추가)
 # =========================================================
 def generate_comic_image_file(book_title: str, book_summary: str) -> ContentFile:
     api_key = getattr(settings, "GEMINI_API_KEY", "")
@@ -324,13 +346,12 @@ def generate_comic_image_file(book_title: str, book_summary: str) -> ContentFile
     2. Create a visual description for 4 panels.
     3. Output ONLY the English description.
     """
-    try:
-        enriched_description = _gemini_generate_text(scenario_prompt, force_json=False)
-    except Exception as e:
-        print(f"시나리오 생성 실패: {e}")
+    
+    enriched_description = _gemini_generate_text(scenario_prompt, force_json=False)
+    if not enriched_description:
         enriched_description = f"Comic about {book_title}. {book_summary}"
 
-    # [단계 2] Imagen에게 이미지 생성 요청 (Textless 강조)
+    # [단계 2] Imagen에게 이미지 생성 요청
     prompt_text = f"""
     Create a high-quality 4-panel comic strip based on this description:
     {enriched_description[:800]}
@@ -344,7 +365,7 @@ def generate_comic_image_file(book_title: str, book_summary: str) -> ContentFile
 
     payload = {
         "instances": [{"prompt": prompt_text}],
-        "parameters": {"sampleCount": 1} # negativePrompt 제거됨
+        "parameters": {"sampleCount": 1}
     }
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
 
@@ -352,17 +373,14 @@ def generate_comic_image_file(book_title: str, book_summary: str) -> ContentFile
 
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=50, verify=False)
-    except Exception as e:
-        raise ValueError(f"통신 에러: {e}")
+        if resp.status_code != 200:
+            raise ValueError(f"Imagen API 실패 ({resp.status_code}): {resp.text}")
 
-    if resp.status_code != 200:
-        raise ValueError(f"Imagen API 실패 ({resp.status_code}): {resp.text}")
-
-    try:
         data = resp.json()
         b64_data = data["predictions"][0]["bytesBase64Encoded"]
         img_content = base64.b64decode(b64_data)
         file_name = f"comic_{int(time.time())}.png"
         return ContentFile(img_content, name=file_name)
     except Exception as e:
-        raise ValueError(f"이미지 데이터 파싱 실패: {e}")
+        logger.error(f"Imagen Gen Failed: {e}")
+        raise ValueError(f"이미지 생성 중 통신 에러: {e}")
