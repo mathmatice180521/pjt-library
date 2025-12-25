@@ -1,0 +1,5 @@
+django 원격 서버 url(대쉬보드)
+https://railway.com/project/2578967a-221e-4cc1-a00b-7d69bc8bf8b1?
+
+django 원격 서버 DB URL(django에서 서버를 받을 시 이 주소 이용)
+unseongx2.up.railway.app

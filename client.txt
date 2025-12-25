@@ -1,0 +1,5 @@
+클라이언트
+https://unseongx2.up.railway.app
+
+VITE_API_URL
++"/api/v1"
