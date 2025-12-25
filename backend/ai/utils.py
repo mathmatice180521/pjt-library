@@ -8,13 +8,17 @@ from typing import Iterable, List, Optional
 
 import requests
 import urllib3
+# SSL 경고 무시
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from django.conf import settings
 from django.core.files.base import ContentFile
 from django.db.models import Q 
 
+# 로깅 설정
 logger = logging.getLogger(__name__)
+
+# SSAFY GMS 프록시
 GEMINI_BASE_URL = "https://gms.ssafy.io/gmsapi/generativelanguage.googleapis.com"
 
 
@@ -84,7 +88,7 @@ def build_keyword_filter_q(keywords: list[str]) -> Q:
 
 
 # =========================================================
-# 1) Gemini generateContent (타임아웃 방어 코드 적용)
+# 1) Gemini generateContent
 # =========================================================
 def _gemini_generate_text(prompt: str, *, force_json: bool = True) -> str:
     api_key = getattr(settings, "GEMINI_API_KEY", "")
@@ -99,15 +103,13 @@ def _gemini_generate_text(prompt: str, *, force_json: bool = True) -> str:
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
 
     try:
-        # [핵심] timeout=(5, 15): 연결 5초, 응답대기 15초. 
-        # 15초 넘으면 즉시 에러 발생시키고 catch 블록으로 이동 -> 서버 다운 방지
-        resp = requests.post(url, json=payload, headers=headers, timeout=(5, 15), verify=False)
+        # [설정] 연결 5초, 응답대기 30초
+        resp = requests.post(url, json=payload, headers=headers, timeout=(5, 30), verify=False)
         resp.raise_for_status() 
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
-        # 에러 발생 시 로그만 남기고 빈 값 반환 -> 이후 로직에서 기본 멘트로 대체됨
-        logger.error(f"Gemini API Timeout/Error: {e}")
-        return ""
+        logger.error(f"Gemini API Error: {e}")
+        return "" 
 
 def build_user_preference_text(v: dict) -> str:
     lines = [f"- 자유요청: {v.get('prompt', '')}"]
@@ -120,24 +122,17 @@ def build_user_preference_text(v: dict) -> str:
 
 def extract_intent_json(user_prompt: str) -> dict:
     p = (user_prompt or "").strip()
-    prompt = f"""
-너는 한국어 문장 이해 전문가다.
-사용자 입력을 '도서 추천'에 쓰기 좋게 구조화(JSON)해라.
-[사용자 입력] {p}
-출력은 JSON만. 스키마:
-{{
-  "intent": "한 줄 의도(20~40자)",
-  "core_topics": ["핵심 주제 1~5개(명사 중심)"],
-  "mood": "감정/분위기(없으면 null)",
-  "request_type": "유형(위로/조언/정보 등, 없으면 null)",
-  "avoid": ["피하고 싶은 것"],
-  "notes": "추가 제약"
-}}
-규칙: '책', '추천', '내용' 등 메타 단어 제외. 주제는 흥미 소재 중심.
-""".strip()
+    # 따옴표 3개 대신 일반 문자열 결합을 사용해 주석 오해 방지
+    prompt = (
+        "너는 한국어 문장 이해 전문가다.\n"
+        "사용자 입력을 '도서 추천'에 쓰기 좋게 구조화(JSON)해라.\n"
+        f"[사용자 입력] {p}\n"
+        "출력은 JSON만. 스키마: {\"intent\": \"한 줄 의도\", \"core_topics\": [\"주제\"], \"mood\": \"분위기\", \"request_type\": \"유형\", \"avoid\": [], \"notes\": \"\"}\n"
+        "규칙: '책', '추천' 등 메타 단어 제외."
+    )
 
     raw = _gemini_generate_text(prompt, force_json=True)
-    if not raw: return {} # 에러나면 빈 딕셔너리
+    if not raw: return {}
 
     data = _extract_json(raw)
     if not isinstance(data, dict): data = {}
@@ -178,10 +173,8 @@ def gemini_embed_text(text: str, *, task_type="RETRIEVAL_QUERY", title=None) -> 
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
 
     try:
-        # 임베딩도 10초 타임아웃
         resp = requests.post(url, json=payload, headers=headers, timeout=(5, 10), verify=False)
         if resp.status_code != 200: 
-            logger.error(f"Embedding Error: {resp.text}")
             return []
         return resp.json()["embedding"]["values"]
     except Exception as e:
@@ -204,7 +197,6 @@ def gemini_batch_embed_texts(texts: List[str], *, _depth: int = 0) -> List[List[
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=(10, 60), verify=False)
         if resp.status_code != 200:
-            logger.error(f"Batch Embed Error: {resp.text}")
             if _depth >= 3: return [[] for _ in texts]
             mid = len(texts) // 2
             left = gemini_batch_embed_texts(texts[:mid], _depth=_depth + 1)
@@ -255,7 +247,7 @@ def ensure_book_embedding(book, *, force: bool = False):
 
 
 # =========================================================
-# 5) Reason Generation (Fallback 강화)
+# 5) Reason Generation
 # =========================================================
 
 def _trim_to_sentence_end(s: str, max_len: int = 250) -> str:
@@ -272,7 +264,7 @@ def _trim_to_sentence_end(s: str, max_len: int = 250) -> str:
     else:
         return truncated.strip() + "..."
 
-# [Fallback] AI 실패 시 나가는 기본 멘트
+# 기본 멘트 (AI 실패시 사용)
 def heuristic_reason(*, book, user_keywords: List[str], mood: Optional[str], themes: List[str]) -> str:
     cat = book.category.name if getattr(book, "category", None) else "이 분야"
     return f"'{book.title}'은 {cat} 분야의 수작으로, 요청하신 주제에 대해 깊이 있는 통찰을 제공합니다. 이 책을 통해 새로운 관점을 얻으실 수 있을 거예요."
@@ -282,54 +274,45 @@ def generate_reason_for_book(*, user_pref_text, user_keywords, mood, themes, boo
     desc = (book.description or "").replace("\n", " ").strip()
     desc = desc[:400]
 
-    prompt = f"""
-당신은 따뜻하고 통찰력 있는 'AI 도서 큐레이터 웅성이'입니다.
-사용자의 고민이나 관심사에 맞춰 이 책을 추천하는 이유를 아래 **형식**에 맞춰 작성해주세요.
-
-[사용자 상황/요청]
-"{user_pref_text}"
-
-[책 정보]
-- 제목: {book.title}
-- 분류: {cat_name}
-- 내용: {desc}
-
-★필수 작성 형식★:
-"{user_pref_text}"에 대해 관심이 있으시군요. 이 책을 추천해 드립니다.
-이 책의 줄거리는 (줄거리 요약) 입니다.
-(추천 이유 1), (추천 이유 2) 때문에 사용자님에게 큰 도움이 될 것입니다.
-
-★작성 규칙★:
-1. DB에 책 내용이 부족하면 당신의 지식(Internal Knowledge)을 활용해 줄거리를 자연스럽게 채우세요.
-2. 추천 이유는 사용자의 상황과 연결하여 구체적인 해결책이나 위로가 되도록 쓰세요.
-3. 문장은 반드시 '입니다/합니다' 체로 정중하게 끝맺으세요.
-4. 중간에 문장이 잘리지 않도록 완결된 문장으로 작성하세요. (공백 포함 200~250자 내외)
-""".strip()
+    # [변경] 따옴표 3개 대신 괄호()와 문자열 합치기를 사용해 주석처럼 보이는 현상 방지
+    prompt = (
+        "당신은 따뜻하고 통찰력 있는 'AI 도서 큐레이터 웅성이'입니다.\n"
+        "사용자의 고민이나 관심사에 맞춰 이 책을 추천하는 이유를 아래 **형식**에 맞춰 작성해주세요.\n\n"
+        f"[사용자 상황/요청] \"{user_pref_text}\"\n\n"
+        f"[책 정보]\n- 제목: {book.title}\n- 분류: {cat_name}\n- 내용: {desc}\n\n"
+        "★필수 작성 형식★:\n"
+        f"\"{user_pref_text}\"에 대해 관심이 있으시군요. 이 책을 추천해 드립니다.\n"
+        "이 책의 줄거리는 (줄거리 요약) 입니다.\n"
+        "(추천 이유 1), (추천 이유 2) 때문에 사용자님에게 큰 도움이 될 것입니다.\n\n"
+        "★작성 규칙★:\n"
+        "1. 줄거리가 부족하면 지식을 활용해 채우세요.\n"
+        "2. 추천 이유는 사용자의 상황과 연결하세요.\n"
+        "3. '입니다/합니다' 체 사용, 200~250자 내외."
+    )
 
     try:
-        # [핵심] 여기서 AI 호출. 실패하면 _gemini_generate_text 내부에서 빈값("") 리턴
         raw = _gemini_generate_text(prompt, force_json=False)
         
-        # 빈값이면 에러로 간주하고 Exception 발생 -> Fallback으로 이동
+        # AI 응답이 없으면 에러 발생시켜서 fallback으로 이동
         if not raw: 
-            raise ValueError("AI response is empty (Timeout or Error)")
+            raise ValueError("AI response is empty")
 
         txt = _strip_wrapping_quotes(_strip_code_fence(raw)).strip()
         final_reason = _trim_to_sentence_end(txt, 280)
         
         if len(final_reason) < 30: 
-            raise ValueError("AI response too short")
+            raise ValueError("Response too short")
             
         return final_reason
 
     except Exception as e:
-        # [방어] 어떤 에러가 나도 절대 서버를 죽이지 않고 기본 멘트 반환
-        logger.warning(f"Using Fallback Reason for {book.title}: {e}")
+        # 에러 발생 시(타임아웃 등) 서버 죽이지 말고 기본 멘트 리턴
+        logger.warning(f"Using Fallback for {book.title}: {e}")
         return heuristic_reason(book=book, user_keywords=user_keywords, mood=mood, themes=themes)
 
 
 # =========================================================
-# 6) Imagen 4.0 4컷 만화 생성 (안전장치 추가)
+# 6) Imagen 4.0 4컷 만화 생성
 # =========================================================
 def generate_comic_image_file(book_title: str, book_summary: str) -> ContentFile:
     api_key = getattr(settings, "GEMINI_API_KEY", "")
@@ -337,31 +320,28 @@ def generate_comic_image_file(book_title: str, book_summary: str) -> ContentFile
 
     url = f"{GEMINI_BASE_URL}/v1beta/models/imagen-4.0-generate-001:predict"
 
-    # [단계 1] 시나리오 생성
-    scenario_prompt = f"""
-    You are a visual storyteller. I need a description for a 4-panel comic strip about the book "{book_title}".
-    Current Book Summary: "{book_summary[:500]}"
-    Task:
-    1. If the summary is short, use your OWN KNOWLEDGE about the book to fill in the plot.
-    2. Create a visual description for 4 panels.
-    3. Output ONLY the English description.
-    """
+    # [단계 1] 시나리오 생성 (주석 오해 방지용 포맷 변경)
+    scenario_prompt = (
+        "You are a visual storyteller. I need a description for a 4-panel comic strip about the book.\n"
+        f"Book Title: {book_title}\n"
+        f"Summary: {book_summary[:500]}\n"
+        "Task:\n"
+        "1. Create a visual description for 4 panels.\n"
+        "2. Output ONLY the English description."
+    )
     
     enriched_description = _gemini_generate_text(scenario_prompt, force_json=False)
     if not enriched_description:
         enriched_description = f"Comic about {book_title}. {book_summary}"
 
-    # [단계 2] Imagen에게 이미지 생성 요청
-    prompt_text = f"""
-    Create a high-quality 4-panel comic strip based on this description:
-    {enriched_description[:800]}
-
-    Style & Constraints:
-    - Webtoon / Manhwa style, colorful, expressive characters.
-    - **STRICTLY SILENT COMIC (NO TEXT, NO BUBBLES)**: Do NOT include any speech bubbles, dialogue boxes, or written text inside the panels.
-    - Visual Storytelling: Use body language and background to convey the meaning without words.
-    - Clear division between 4 panels.
-    """
+    # [단계 2] Imagen 요청
+    prompt_text = (
+        f"Create a high-quality 4-panel comic strip based on this description:\n{enriched_description[:800]}\n\n"
+        "Style & Constraints:\n"
+        "- Webtoon / Manhwa style, colorful.\n"
+        "- **STRICTLY SILENT COMIC (NO TEXT)**: No bubbles/text.\n"
+        "- Clear division between 4 panels."
+    )
 
     payload = {
         "instances": [{"prompt": prompt_text}],
@@ -372,7 +352,6 @@ def generate_comic_image_file(book_title: str, book_summary: str) -> ContentFile
     print(f"🔥 [DEBUG] Imagen 요청 시작 (Title: {book_title})")
 
     try:
-        # 이미지 생성도 타임아웃 50초 설정
         resp = requests.post(url, json=payload, headers=headers, timeout=50, verify=False)
         if resp.status_code != 200:
             raise ValueError(f"Imagen API 실패 ({resp.status_code}): {resp.text}")
